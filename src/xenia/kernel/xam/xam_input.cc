@@ -120,14 +120,26 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
     // Always pin user to 0.
     actual_user_index = 0;
   }
+  // ROCKNIX/Odin: actual_user_index above was computed but never used below
+  // (GetState was called with the original, un-pinned user_index), and a
+  // bare X_INPUT_FLAG_ANY_USER with no concrete device flag could fail
+  // driver filtering entirely. Diablo 3 polls ANY_USER right after the
+  // built-in keyboard closes; without this it looked alive but input-dead.
+  uint32_t actual_flags = !flags ? X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD : flags;
+  if ((actual_flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER) != 0) {
+    actual_flags &= ~X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER;
+  }
+  if ((actual_flags & (X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD |
+                       X_INPUT_FLAG::X_INPUT_FLAG_KEYBOARD)) == 0) {
+    actual_flags = X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD;
+  }
 
   X_RESULT result;
   auto input_system = kernel_state()->emulator()->input_system();
   {
     auto lock = input_system->lock();
-    result = input_system->GetState(
-        user_index, !flags ? X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD : flags,
-        input_state);
+    result = input_system->GetState(actual_user_index, actual_flags,
+                                    input_state);
   }
 
   if (input_state && result == X_ERROR_SUCCESS) {
@@ -175,10 +187,20 @@ dword_result_t XamInputGetKeystroke_entry(
     // Always pin user to 0.
     actual_user_index = 0;
   }
+  // ROCKNIX/Odin: same actual_user_index/actual_flags fix as
+  // XamInputGetState_entry above.
+  uint32_t actual_flags = flags;
+  if ((actual_flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER) != 0) {
+    actual_flags &= ~X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER;
+  }
+  if ((actual_flags & (X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD |
+                       X_INPUT_FLAG::X_INPUT_FLAG_KEYBOARD)) == 0) {
+    actual_flags = X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD;
+  }
 
   auto input_system = kernel_state()->emulator()->input_system();
   auto lock = input_system->lock();
-  return input_system->GetKeystroke(user_index, flags, keystroke);
+  return input_system->GetKeystroke(actual_user_index, actual_flags, keystroke);
 }
 DECLARE_XAM_EXPORT1(XamInputGetKeystroke, kInput, kImplemented);
 
