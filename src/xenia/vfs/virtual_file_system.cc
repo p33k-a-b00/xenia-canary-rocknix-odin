@@ -244,6 +244,31 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
+    // ROCKNIX/Odin (EXPERIMENTAL, result unconfirmed as of 2026-06-30): the
+    // Sims 3 save flow creates a zero-byte "CORRUPT" marker as a file,
+    // writes/flushes the real save, then reopens "CORRUPT" with the
+    // FILE_DIRECTORY_FILE option and DELETE access to clean the marker up.
+    // Returning STATUS_NOT_A_DIRECTORY here left the game spinning after
+    // save-name confirmation. This treats that exact marker-cleanup open as
+    // a normal file open so the later XFileDispositionInformation
+    // delete-on-close path can run. Narrowly scoped (open-disposition +
+    // delete-access + literal "CORRUPT" name) so it shouldn't affect any
+    // other title's directory handling.
+    if (!(entry->attributes() & kFileAttributeDirectory) && is_directory) {
+      constexpr uint32_t kDeleteAccess = 0x00010000;
+      const bool is_corrupt_marker_cleanup =
+          creation_disposition == FileDisposition::kOpen &&
+          (desired_access & kDeleteAccess) != 0 && entry->name() == "CORRUPT";
+      if (!is_corrupt_marker_cleanup) {
+        return X_STATUS_NOT_A_DIRECTORY;
+      }
+      XELOGI(
+          "SAVE_TRACE OpenFile allowing CORRUPT marker cleanup despite "
+          "directory option path='{}' entry='{}' desired={:08X}",
+          path, entry->path(), desired_access);
+      is_directory = false;
+    }
+
     // If the entry does not exist on the host then remove the cached entry
     if (parent_entry) {
       const xe::vfs::HostPathEntry* host_path =
