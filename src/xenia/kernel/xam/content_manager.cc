@@ -32,6 +32,21 @@ static const char* kSpaFilename = "spa.bin";
 
 static int content_device_id_ = 0;
 
+// ROCKNIX/Odin: diagnostic logging for the Xbox 360 save/content path,
+// added while tracking down Sims 3 save rejection/freeze bugs. Cheap
+// (info-level, only on content open/close/create/delete), kept because it
+// is genuinely useful for future save-related debugging on this hardware.
+static std::string DescribeContentData(
+    const XCONTENT_AGGREGATE_DATA& content_data) {
+  return fmt::format(
+      "device={:08X} type={:08X} title={:08X} xuid={:016X} file='{}' "
+      "display='{}'",
+      uint32_t(content_data.device_id.get()),
+      uint32_t(content_data.content_type.get()),
+      uint32_t(content_data.title_id.get()), uint64_t(content_data.xuid.get()),
+      content_data.file_name(), xe::to_utf8(content_data.display_name()));
+}
+
 ContentPackage::ContentPackage(KernelState* kernel_state,
                                const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
@@ -48,10 +63,15 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+  XELOGI("SAVE_TRACE ContentPackage mount root='{}' device='{}' host='{}' {}",
+         root_name_, device_path_, xe::path_to_utf8(package_path),
+         DescribeContentData(content_data_));
 }
 
 ContentPackage::~ContentPackage() {
   auto fs = kernel_state_->file_system();
+  XELOGI("SAVE_TRACE ContentPackage unmount root='{}' device='{}' {}",
+         root_name_, device_path_, DescribeContentData(content_data_));
   fs->UnregisterSymbolicLink(root_name_ + ":");
   fs->UnregisterDevice(device_path_);
 }
@@ -302,7 +322,13 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
   if (data.title_id == -1) {
     data.title_id = kernel_state_->title_id();
   }
-  if (data.xuid == -1) {
+  // ROCKNIX/Odin: Sims 3 enumerated its own saved-game package as anonymous
+  // (xuid 0) content rather than profile-owned, because only the -1
+  // ("unset") sentinel was being normalized to the active profile XUID, not
+  // the literal 0 some titles pass. Normalizing 0 too matches the path
+  // resolution already used below (`used_xuid`) and fixed Sims 3 save
+  // enumeration.
+  if (data.xuid == -1 || data.xuid == 0) {
     data.xuid = xuid;
   }
   uint64_t used_xuid =
@@ -311,9 +337,13 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
   auto header_path = ResolvePackageHeaderPath(data.file_name(), used_xuid,
                                               data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
+  XELOGI("SAVE_TRACE WriteContentHeader begin path='{}' {}",
+         xe::path_to_utf8(header_path), DescribeContentData(data));
 
   if (!std::filesystem::exists(parent_path)) {
     if (!std::filesystem::create_directories(parent_path)) {
+      XELOGI("SAVE_TRACE WriteContentHeader mkdir failed parent='{}' -> {:08X}",
+             xe::path_to_utf8(parent_path), uint32_t(X_STATUS_ACCESS_DENIED));
       return X_STATUS_ACCESS_DENIED;
     }
   }
@@ -322,10 +352,17 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
 
   if (std::filesystem::exists(header_path)) {
     auto file = xe::filesystem::OpenFile(header_path, "wb");
-    fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
+    const size_t written = fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
     fclose(file);
+    XELOGI(
+        "SAVE_TRACE WriteContentHeader wrote path='{}' bytes={} expected={} "
+        "-> {:08X}",
+        xe::path_to_utf8(header_path), written,
+        sizeof(XCONTENT_AGGREGATE_DATA), uint32_t(X_STATUS_SUCCESS));
     return X_STATUS_SUCCESS;
   }
+  XELOGI("SAVE_TRACE WriteContentHeader missing path='{}' -> {:08X}",
+         xe::path_to_utf8(header_path), uint32_t(X_STATUS_NO_SUCH_FILE));
   return X_STATUS_NO_SUCH_FILE;
 }
 
@@ -368,16 +405,25 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
 
   if (open_packages_.count(string_key_insensitive(root_name))) {
     // Already content open with this root name.
+    XELOGI("SAVE_TRACE CreateContent root='{}' already open -> {:08X}",
+           root_name, uint32_t(X_ERROR_ALREADY_EXISTS));
     return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
+  XELOGI("SAVE_TRACE CreateContent begin root='{}' xuid={:016X} path='{}' {}",
+         root_name, xuid, xe::path_to_utf8(package_path),
+         DescribeContentData(data));
   if (std::filesystem::exists(package_path)) {
     // Exists, must not!
+    XELOGI("SAVE_TRACE CreateContent exists path='{}' -> {:08X}",
+           xe::path_to_utf8(package_path), uint32_t(X_ERROR_ALREADY_EXISTS));
     return X_ERROR_ALREADY_EXISTS;
   }
 
   if (!std::filesystem::create_directories(package_path)) {
+    XELOGI("SAVE_TRACE CreateContent mkdir failed path='{}' -> {:08X}",
+           xe::path_to_utf8(package_path), uint32_t(X_ERROR_ACCESS_DENIED));
     return X_ERROR_ACCESS_DENIED;
   }
 
@@ -387,6 +433,8 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
   open_packages_.insert(
       {string_key_insensitive::create(root_name), package.release()});
 
+  XELOGI("SAVE_TRACE CreateContent success root='{}' path='{}' -> {:08X}",
+         root_name, xe::path_to_utf8(package_path), uint32_t(X_ERROR_SUCCESS));
   return X_ERROR_SUCCESS;
 }
 
@@ -399,12 +447,19 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
 
   if (open_packages_.count(string_key_insensitive(root_name))) {
     // Already content open with this root name.
+    XELOGI("SAVE_TRACE OpenContent root='{}' already open -> {:08X}",
+           root_name, uint32_t(X_ERROR_ALREADY_EXISTS));
     return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data, disc_number);
+  XELOGI("SAVE_TRACE OpenContent begin root='{}' xuid={:016X} path='{}' {}",
+         root_name, xuid, xe::path_to_utf8(package_path),
+         DescribeContentData(data));
   if (!std::filesystem::exists(package_path)) {
     // Does not exist, must be created.
+    XELOGI("SAVE_TRACE OpenContent missing path='{}' -> {:08X}",
+           xe::path_to_utf8(package_path), uint32_t(X_ERROR_FILE_NOT_FOUND));
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -432,16 +487,25 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
   open_packages_.insert(
       {string_key_insensitive::create(root_name), package.release()});
 
+  XELOGI(
+      "SAVE_TRACE OpenContent success root='{}' path='{}' license={:08X} "
+      "-> {:08X}",
+      root_name, xe::path_to_utf8(package_path), content_license,
+      uint32_t(X_ERROR_SUCCESS));
   return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
+  XELOGI("SAVE_TRACE CloseContent begin root='{}' open_count={}", root_name,
+         open_packages_.size());
 
   // 415607D6 - Uses XamContentCreate with name "save", but XamContentClose with
   // "SAVE".
   auto it = open_packages_.find(string_key_insensitive(root_name));
   if (it == open_packages_.end()) {
+    XELOGI("SAVE_TRACE CloseContent root='{}' not found -> {:08X}", root_name,
+           uint32_t(X_ERROR_FILE_NOT_FOUND));
     return X_ERROR_FILE_NOT_FOUND;
   }
   CloseOpenedFilesFromContent(root_name);
@@ -450,6 +514,8 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   open_packages_.erase(it);
   delete package;
 
+  XELOGI("SAVE_TRACE CloseContent success root='{}' -> {:08X}", root_name,
+         uint32_t(X_ERROR_SUCCESS));
   return X_ERROR_SUCCESS;
 }
 
@@ -495,13 +561,21 @@ X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
 
   if (IsContentOpen(data)) {
     // TODO(Gliniak): Get real error code for this case.
+    XELOGI("SAVE_TRACE DeleteContent open xuid={:016X} {} -> {:08X}", xuid,
+           DescribeContentData(data), uint32_t(X_ERROR_ACCESS_DENIED));
     return X_ERROR_ACCESS_DENIED;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
+  XELOGI("SAVE_TRACE DeleteContent begin xuid={:016X} path='{}' {}", xuid,
+         xe::path_to_utf8(package_path), DescribeContentData(data));
   if (std::filesystem::remove_all(package_path) > 0) {
+    XELOGI("SAVE_TRACE DeleteContent success path='{}' -> {:08X}",
+           xe::path_to_utf8(package_path), uint32_t(X_ERROR_SUCCESS));
     return X_ERROR_SUCCESS;
   } else {
+    XELOGI("SAVE_TRACE DeleteContent missing path='{}' -> {:08X}",
+           xe::path_to_utf8(package_path), uint32_t(X_ERROR_FILE_NOT_FOUND));
     return X_ERROR_FILE_NOT_FOUND;
   }
 }
@@ -534,12 +608,18 @@ void ContentManager::CloseOpenedFilesFromContent(
   std::string resolved_path = "";
   kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':',
                                                  resolved_path);
+  XELOGI("SAVE_TRACE CloseOpenedFilesFromContent root='{}' resolved='{}'",
+         root_name, resolved_path);
 
   for (const object_ref<XFile>& file : all_files_handles) {
     std::string file_path = file->entry()->absolute_path();
     bool is_file_inside_content = utf8::starts_with(file_path, resolved_path);
 
     if (is_file_inside_content) {
+      XELOGI(
+          "SAVE_TRACE CloseOpenedFilesFromContent releasing handle={:08X} "
+          "path='{}'",
+          file->handle(), file_path);
       file->ReleaseHandle();
     }
   }
