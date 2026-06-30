@@ -21,6 +21,53 @@ namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
+// ROCKNIX/Odin: see the matching helpers in xboxkrnl_io.cc.
+static bool ShouldTraceSavePath(std::string_view path) {
+  return path.find("\\Device\\Content\\") != std::string_view::npos ||
+         path.find("454108E2") != std::string_view::npos ||
+         path.find("SAVE8") != std::string_view::npos ||
+         path.find("TTEEMMPP") != std::string_view::npos ||
+         path.find("CORRUPT") != std::string_view::npos ||
+         path.find("Swas") != std::string_view::npos ||
+         path.find("sims3") != std::string_view::npos ||
+         path.find(".header") != std::string_view::npos;
+}
+
+static bool ShouldTraceSaveFile(const XFile* file) {
+  if (!file || !file->entry()) {
+    return false;
+  }
+
+  return ShouldTraceSavePath(file->entry()->absolute_path()) ||
+         ShouldTraceSavePath(file->entry()->path()) ||
+         ShouldTraceSavePath(file->entry()->name());
+}
+
+static const char* FileInformationClassName(uint32_t info_class) {
+  switch (info_class) {
+    case XFileBasicInformation:
+      return "XFileBasicInformation";
+    case XFileInternalInformation:
+      return "XFileInternalInformation";
+    case XFilePositionInformation:
+      return "XFilePositionInformation";
+    case XFileAlignmentInformation:
+      return "XFileAlignmentInformation";
+    case XFileAllocationInformation:
+      return "XFileAllocationInformation";
+    case XFileEndOfFileInformation:
+      return "XFileEndOfFileInformation";
+    case XFileSectorInformation:
+      return "XFileSectorInformation";
+    case XFileXctdCompressionInformation:
+      return "XFileXctdCompressionInformation";
+    case XFileNetworkOpenInformation:
+      return "XFileNetworkOpenInformation";
+    default:
+      return "Unknown";
+  }
+}
+
 uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
   switch (info_class) {
     case XFileInternalInformation:
@@ -103,14 +150,26 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileXctdCompressionInformation: {
-      XELOGE(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      // ROCKNIX/Odin: Sims 3 queries this for every save file and aborts the
+      // save (leaving a CORRUPT marker) on any error. Returning success
+      // unconditionally was tried and hangs the normal boot path instead
+      // (some non-save file gets read down the XCTD path and loops), so only
+      // report "not compressed" for files under a mounted save content
+      // package; everything else keeps the original unimplemented error.
+      if (ShouldTraceSaveFile(file.get())) {
+        auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+        info->unknown = 0;  // not XCTD compressed
+        out_length = sizeof(*info);
+      } else {
+        XELOGE(
+            "NtQueryInformationFile(XFileXctdCompressionInformation) "
+            "unimplemented");
+        // Files that are XCTD compressed begin with the magic 0x0FF512ED but
+        // we shouldn't detect this that way. There's probably a flag
+        // somewhere (attributes?) that defines if it's compressed or not.
+        status = X_STATUS_INVALID_PARAMETER;
+        out_length = 0;
+      }
       break;
     };
     case XFileNetworkOpenInformation: {
@@ -137,6 +196,19 @@ dword_result_t NtQueryInformationFile_entry(
       out_length = 0;
       break;
     }
+  }
+
+  if (ShouldTraceSaveFile(file.get())) {
+    XELOGI(
+        "SAVE_TRACE NtQueryInformationFile handle={:08X} path='{}' "
+        "class={}({}) len={} -> status={:08X} out={} size={} alloc={} "
+        "attrs={:08X}",
+        uint32_t(file_handle), file->entry()->absolute_path(),
+        FileInformationClassName(info_class), uint32_t(info_class),
+        uint32_t(info_length), uint32_t(status), out_length,
+        uint64_t(file->entry()->size()),
+        uint64_t(file->entry()->allocation_size()),
+        uint32_t(file->entry()->attributes()));
   }
 
   if (io_status_block_ptr) {
@@ -291,6 +363,26 @@ dword_result_t NtSetInformationFile_entry(
       assert_always();
       out_length = 0;
       break;
+  }
+
+  if (ShouldTraceSaveFile(file.get())) {
+    uint64_t value = 0;
+    if (info_length >= sizeof(xe::be<uint64_t>) &&
+        (info_class == XFileAllocationInformation ||
+         info_class == XFileEndOfFileInformation ||
+         info_class == XFilePositionInformation)) {
+      value = *info_ptr.as<xe::be<uint64_t>*>();
+    }
+    XELOGI(
+        "SAVE_TRACE NtSetInformationFile handle={:08X} path='{}' "
+        "class={}({}) len={} value={} -> status={:08X} out={} size={} "
+        "alloc={} attrs={:08X}",
+        uint32_t(file_handle), file->entry()->absolute_path(),
+        FileInformationClassName(info_class), uint32_t(info_class),
+        uint32_t(info_length), value, uint32_t(result), out_length,
+        uint64_t(file->entry()->size()),
+        uint64_t(file->entry()->allocation_size()),
+        uint32_t(file->entry()->attributes()));
   }
 
   if (io_status_block) {

@@ -7,6 +7,9 @@
  ******************************************************************************
  */
 
+#include <atomic>
+#include <cstring>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -34,7 +37,62 @@ struct CreateOptions {
   static constexpr uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
   // Optimization - file access will be random, not sequential.
   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
+  static constexpr uint32_t FILE_DELETE_ON_CLOSE = 0x00001000;
 };
+
+// ROCKNIX/Odin: SAVE_TRACE/SAVE_FAIL diagnostic logging for the Xbox 360
+// save/content I/O path, added while tracking down Sims 3 save rejection/
+// freeze bugs (e.g. the SAVE8:\CORRUPT marker-cleanup case). Kept because it
+// is cheap (filtered to save-shaped paths, or armed only once a content
+// package is actually mounted) and has already proven useful for diagnosing
+// title-specific save behavior on this hardware.
+static bool ShouldTraceSavePath(std::string_view path) {
+  return path.find("\\Device\\Content\\") != std::string_view::npos ||
+         path.find("454108E2") != std::string_view::npos ||
+         path.find("SAVE8") != std::string_view::npos ||
+         path.find("TTEEMMPP") != std::string_view::npos ||
+         path.find("CORRUPT") != std::string_view::npos ||
+         path.find("Swas") != std::string_view::npos ||
+         path.find("sims3") != std::string_view::npos ||
+         path.find(".header") != std::string_view::npos;
+}
+
+static bool ShouldTraceSaveFile(const XFile* file) {
+  if (!file || !file->entry()) {
+    return false;
+  }
+
+  return ShouldTraceSavePath(file->entry()->absolute_path()) ||
+         ShouldTraceSavePath(file->entry()->path()) ||
+         ShouldTraceSavePath(file->entry()->name());
+}
+
+// Armed the first time a save content package is mounted. While armed, every
+// failing file op is logged regardless of path, so a failed reopen/append/stage
+// on cache:\, scratch:\ or save:\ (which the content-only filter above drops)
+// becomes visible.
+static std::atomic<bool> g_save_window_active{false};
+
+static void MaybeArmSaveWindow(std::string_view resolved_path) {
+  if (resolved_path.find("\\Device\\Content\\") != std::string_view::npos) {
+    g_save_window_active.store(true, std::memory_order_relaxed);
+  }
+}
+
+static void LogSaveFailure(const char* op, uint32_t file_handle,
+                           std::string_view requested_path, X_STATUS status) {
+  if (!XFAILED(status)) return;
+  if (!g_save_window_active.load(std::memory_order_relaxed)) return;
+  std::string resolved(requested_path);
+  if (file_handle) {
+    auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+    if (file && file->entry()) {
+      resolved = file->entry()->absolute_path();
+    }
+  }
+  XELOGI("SAVE_FAIL op={} handle={:08X} status={:08X} path='{}'", op,
+         file_handle, uint32_t(status), resolved);
+}
 
 dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
                                   pointer_t<X_OBJECT_ATTRIBUTES> object_attrs,
@@ -79,7 +137,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   // Attempt open (or create).
   vfs::File* vfs_file;
-  vfs::FileAction file_action;
+  vfs::FileAction file_action = vfs::FileAction::kDoesNotExist;
   X_STATUS result = kernel_state()->file_system()->OpenFile(
       root_entry, target_path,
       vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
@@ -98,6 +156,12 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
+    // ROCKNIX/Odin: Sims 3's CORRUPT-marker save cleanup reopens an existing
+    // file with delete-on-close semantics; without honoring this flag the
+    // marker was never actually scheduled for deletion.
+    if (create_options & CreateOptions::FILE_DELETE_ON_CLOSE) {
+      file->entry()->SetForDeletion(true);
+    }
   }
 
   if (io_status_block) {
@@ -106,6 +170,31 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
 
   *handle_out = handle;
+
+  const std::string root_path =
+      root_entry ? root_entry->absolute_path() : std::string();
+  if (ShouldTraceSavePath(target_path) || ShouldTraceSavePath(root_path) ||
+      ShouldTraceSaveFile(file.get())) {
+    XELOGI(
+        "SAVE_TRACE NtCreateFile path='{}' root='{}' desired={:08X} "
+        "attrs={:08X} share={:08X} disp={} options={:08X} alloc={} -> "
+        "status={:08X} handle={:08X} action={} dir={} nondir={} delclose={} "
+        "entry='{}'",
+        target_path, root_path, uint32_t(desired_access),
+        uint32_t(file_attributes), uint32_t(share_access),
+        uint32_t(creation_disposition), uint32_t(create_options),
+        allocation_size, uint32_t(result), uint32_t(handle),
+        uint32_t(file_action),
+        (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+        (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0,
+        (create_options & CreateOptions::FILE_DELETE_ON_CLOSE) != 0,
+        file ? file->entry()->absolute_path() : std::string());
+  }
+
+  if (file) {
+    MaybeArmSaveWindow(file->entry()->absolute_path());
+  }
+  LogSaveFailure("NtCreateFile", uint32_t(handle), target_path, result);
 
   return result;
 }
@@ -211,6 +300,18 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
     ev->Set(0, false);
   }
 
+  if (file && ShouldTraceSaveFile(file.get())) {
+    uint32_t bytes = io_status_block ? uint32_t(io_status_block->information) : 0;
+    XELOGI(
+        "SAVE_TRACE NtReadFile handle={:08X} path='{}' requested={} read={} "
+        "offset={} -> status={:08X}",
+        uint32_t(file_handle), file->entry()->absolute_path(),
+        uint32_t(buffer_length), bytes,
+        byte_offset_ptr ? uint64_t(*byte_offset_ptr) : uint64_t(-1),
+        uint32_t(result));
+  }
+  LogSaveFailure("NtReadFile", uint32_t(file_handle), {}, result);
+
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT2(NtReadFile, kFileSystem, kImplemented, kHighFrequency);
@@ -297,6 +398,8 @@ dword_result_t NtReadFileScatter_entry(
     ev->Set(0, false);
   }
 
+  LogSaveFailure("NtReadFileScatter", uint32_t(file_handle), {}, result);
+
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtReadFileScatter, kFileSystem, kImplemented);
@@ -375,6 +478,25 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
     }
   }
 
+  if (file && ShouldTraceSaveFile(file.get())) {
+    const uint64_t byte_offset =
+        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1);
+    uint32_t bytes_written = 0;
+    if (io_status_block) {
+      bytes_written = io_status_block->information;
+    }
+    uint32_t first_word = 0;
+    if (buffer_length >= sizeof(first_word)) {
+      auto host_buf = kernel_memory()->TranslateVirtual(buffer.guest_address());
+      std::memcpy(&first_word, host_buf, sizeof(first_word));
+    }
+    XELOGI(
+        "SAVE_TRACE NtWriteFile handle={:08X} path='{}' offset={} "
+        "requested={} written={} first_word={:08X} -> status={:08X}",
+        uint32_t(file_handle), file->entry()->absolute_path(), byte_offset,
+        uint32_t(buffer_length), bytes_written, first_word, uint32_t(result));
+  }
+
   if (XFAILED(result) && io_status_block) {
     io_status_block->status = result;
     io_status_block->information = 0;
@@ -383,6 +505,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
   if (ev && signal_event) {
     ev->Set(0, false);
   }
+
+  LogSaveFailure("NtWriteFile", uint32_t(file_handle), {}, result);
 
   return result;
 }
@@ -560,6 +684,13 @@ DECLARE_XBOXKRNL_EXPORT1(NtQueryDirectoryFile, kFileSystem, kImplemented);
 dword_result_t NtFlushBuffersFile_entry(
     dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
   auto result = X_STATUS_SUCCESS;
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+
+  if (file && ShouldTraceSaveFile(file.get())) {
+    XELOGI("SAVE_TRACE NtFlushBuffersFile handle={:08X} path='{}' -> {:08X}",
+           uint32_t(file_handle), file->entry()->absolute_path(),
+           uint32_t(result));
+  }
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
