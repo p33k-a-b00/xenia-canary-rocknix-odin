@@ -963,8 +963,35 @@ void ImGuiDrawer::UpdateGamepads() {
       }
     }
   }
+  // ROCKNIX/Odin: io.ClearInputKeys() here wipes more ImGui input/nav state
+  // than intended (every frame with no button currently pressed), which made
+  // D-pad navigation brittle inside modal dialogs like the on-screen
+  // keyboard. Only release the gamepad-specific keys instead, and keep
+  // ImGuiBackendFlags_HasGamepad set so ImGui doesn't think the gamepad
+  // disappeared just because nothing is held down this frame.
+  auto release_gamepad_keys = [&io]() {
+    const ImGuiKey gamepad_keys[] = {
+        ImGuiKey_GamepadStart,      ImGuiKey_GamepadBack,
+        ImGuiKey_GamepadFaceLeft,   ImGuiKey_GamepadFaceRight,
+        ImGuiKey_GamepadFaceUp,     ImGuiKey_GamepadFaceDown,
+        ImGuiKey_GamepadDpadLeft,   ImGuiKey_GamepadDpadRight,
+        ImGuiKey_GamepadDpadUp,     ImGuiKey_GamepadDpadDown,
+        ImGuiKey_GamepadL1,         ImGuiKey_GamepadR1,
+        ImGuiKey_GamepadL2,         ImGuiKey_GamepadR2,
+        ImGuiKey_GamepadL3,         ImGuiKey_GamepadR3,
+        ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight,
+        ImGuiKey_GamepadLStickUp,   ImGuiKey_GamepadLStickDown,
+        ImGuiKey_GamepadRStickLeft, ImGuiKey_GamepadRStickRight,
+        ImGuiKey_GamepadRStickUp,   ImGuiKey_GamepadRStickDown,
+    };
+    for (ImGuiKey key : gamepad_keys) {
+      io.AddKeyEvent(key, false);
+    }
+  };
+
   if (controller_to_poke == XUserIndexNone) {
-    io.ClearInputKeys();
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    release_gamepad_keys();
     return;
   }
 
