@@ -28,6 +28,10 @@
 #include "xenia/kernel/xam/ui/signin_ui.h"
 #include "xenia/kernel/xam/ui/title_info_ui.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+
 DEFINE_bool(storage_selection_dialog, false,
             "Show storage device selection dialog when the game requests it.",
             "UI");
@@ -274,9 +278,6 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
     if (description_.size()) {
       ImGui::TextWrapped("%s", description_.c_str());
     }
-    if (first_draw) {
-      ImGui::SetKeyboardFocusHere();
-    }
     ImGui::PushID("input_text");
     bool input_submitted =
         ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
@@ -293,14 +294,95 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
       ImGui::EndPopup();
     }
     ImGui::PopID();
+
+    // ROCKNIX/Odin: built-in on-screen keyboard (no physical keyboard on the
+    // handheld). D-pad/face buttons drive ImGui's gamepad navigation over
+    // these buttons; see xenia/ui/imgui_drawer.cc's idle-gamepad-key handling
+    // for why focus stays usable here.
+    auto text_length = [&]() -> size_t {
+      size_t length = 0;
+      while (length < text_buffer_.size() && text_buffer_[length] != '\0') {
+        ++length;
+      }
+      return length;
+    };
+    auto append_text = [&](const char* text) {
+      if (!text || text_buffer_.empty()) {
+        return;
+      }
+      size_t length = text_length();
+      size_t available = text_buffer_.size() > length
+                             ? text_buffer_.size() - length - 1
+                             : 0;
+      if (!available) {
+        return;
+      }
+      size_t append_length = std::min(std::strlen(text), available);
+      std::memcpy(text_buffer_.data() + length, text, append_length);
+      text_buffer_[length + append_length] = '\0';
+    };
+    auto backspace_text = [&]() {
+      size_t length = text_length();
+      if (length) {
+        text_buffer_[length - 1] = '\0';
+      }
+    };
+    auto clear_text = [&]() {
+      if (!text_buffer_.empty()) {
+        text_buffer_[0] = '\0';
+      }
+    };
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("On-screen keyboard");
+    constexpr float kKeyWidth = 48.0f;
+    constexpr float kKeyHeight = 40.0f;
+    const char* rows[] = {"1234567890", "qwertyuiop", "asdfghjkl",
+                          "zxcvbnm"};
+    if (first_draw) {
+      ImGui::SetKeyboardFocusHere();
+    }
+    for (const char* row : rows) {
+      for (const char* key = row; *key; ++key) {
+        unsigned char key_char = static_cast<unsigned char>(*key);
+        char label[2] = {
+            shift_ && std::isalpha(key_char)
+                ? static_cast<char>(std::toupper(key_char))
+                : *key,
+            '\0'};
+        if (ImGui::Button(label, ImVec2(kKeyWidth, kKeyHeight))) {
+          append_text(label);
+        }
+        if (*(key + 1)) {
+          ImGui::SameLine();
+        }
+      }
+    }
+    if (ImGui::Button(shift_ ? "Shift: ON" : "Shift",
+                      ImVec2(kKeyWidth * 3.0f, kKeyHeight))) {
+      shift_ = !shift_;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Space", ImVec2(kKeyWidth * 4.0f, kKeyHeight))) {
+      append_text(" ");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Backspace", ImVec2(kKeyWidth * 3.0f, kKeyHeight))) {
+      backspace_text();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear", ImVec2(kKeyWidth * 2.0f, kKeyHeight))) {
+      clear_text();
+    }
+
     if (input_submitted) {
-      text_ = std::string(text_buffer_.data(), text_buffer_.size());
+      text_ = std::string(text_buffer_.data());
       cancelled_ = false;
       ImGui::CloseCurrentPopup();
       Close();
     }
     if (ImGui::Button("OK")) {
-      text_ = std::string(text_buffer_.data(), text_buffer_.size());
+      text_ = std::string(text_buffer_.data());
       cancelled_ = false;
       ImGui::CloseCurrentPopup();
       Close();
@@ -478,29 +560,44 @@ dword_result_t XamShowKeyboardUI_entry(
     };
     result = xeXamDispatchHeadless(run, overlapped);
   } else {
-    auto close = [buffer, buffer_length](KeyboardInputDialog* dialog,
-                                         uint32_t& extended_error,
-                                         uint32_t& length) -> X_RESULT {
+    std::string title_str = title ? xe::to_utf8(title.value()) : "";
+    std::string desc_str = description ? xe::to_utf8(description.value()) : "";
+    std::string def_text_str =
+        default_text ? xe::to_utf8(default_text.value()) : "";
+
+    // ROCKNIX/Odin: report the real submitted-character count in `length`
+    // (some titles, e.g. Diablo 3, poll this after the keyboard closes) and
+    // always zero the buffer first so a cancelled/short result can't leak the
+    // previous buffer contents. Logged so a fresh xenia.log can confirm the
+    // keyboard's completion path actually ran with the expected values.
+    auto close = [buffer, buffer_length, buffer_size](
+                     KeyboardInputDialog* dialog, uint32_t& extended_error,
+                     uint32_t& length) -> X_RESULT {
       if (dialog->cancelled()) {
+        std::memset(buffer, 0, buffer_size);
         extended_error = X_ERROR_CANCELLED;
         length = 0;
+        XELOGI("XamShowKeyboardUI complete cancelled extended={:08X} length={}",
+               uint32_t(extended_error), length);
         return X_ERROR_SUCCESS;
       } else {
-        // Zero the output buffer.
+        std::memset(buffer, 0, buffer_size);
         auto text = xe::to_utf16(dialog->text());
         string_util::copy_and_swap_truncating(buffer, text, buffer_length);
         extended_error = X_ERROR_SUCCESS;
-        length = 0;
+        const size_t max_result_chars =
+            buffer_length ? static_cast<size_t>(buffer_length - 1) : 0;
+        length = static_cast<uint32_t>(std::min(text.size(), max_result_chars));
+        XELOGI(
+            "XamShowKeyboardUI complete text_chars={} buffer_length={} "
+            "extended={:08X} length={}",
+            text.size(), uint32_t(buffer_length), uint32_t(extended_error),
+            length);
         return X_ERROR_SUCCESS;
       }
     };
     const Emulator* emulator = kernel_state()->emulator();
     xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
-
-    std::string title_str = title ? xe::to_utf8(title.value()) : "";
-    std::string desc_str = description ? xe::to_utf8(description.value()) : "";
-    std::string def_text_str =
-        default_text ? xe::to_utf8(default_text.value()) : "";
 
     result = xeXamDispatchDialogEx<KeyboardInputDialog>(
         new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,

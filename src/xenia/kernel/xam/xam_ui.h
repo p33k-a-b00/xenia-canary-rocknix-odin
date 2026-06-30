@@ -110,6 +110,8 @@ class KeyboardInputDialog : public XamDialog {
   std::vector<char> text_buffer_;
   std::string text_ = "";
   bool cancelled_ = true;
+  // ROCKNIX/Odin: Shift toggle state for the built-in on-screen keyboard.
+  bool shift_ = false;
 };
 
 bool xeDrawProfileContent(xe::ui::ImGuiDrawer* imgui_drawer,
