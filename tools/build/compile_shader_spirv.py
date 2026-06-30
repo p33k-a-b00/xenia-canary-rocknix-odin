@@ -12,6 +12,7 @@ Pipeline:
 """
 
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -31,20 +32,42 @@ XESL_WRAPPER = (
 )
 
 
+# ROCKNIX/Odin: the cross-compiled ARM64 builder image's Ubuntu glslang-tools/
+# spirv-tools packages don't always land in VULKAN_SDK, and its spirv-opt
+# rejected this script's original --canonicalize-ids flag. find_vulkan_tools
+# now falls back to PATH per-tool via shutil.which (so a partial toolchain
+# still resolves what it has) and main() degrades gracefully when spirv-opt/
+# spirv-dis are missing instead of hard failing the whole shader build.
 def find_vulkan_tools():
     """Find Vulkan SDK tools via VULKAN_SDK env or PATH."""
+    def find_tool(name):
+        candidates = [name]
+        if os.name == "nt" and not name.endswith(".exe"):
+            candidates.insert(0, name + ".exe")
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return None
+
     vulkan_sdk = os.environ.get("VULKAN_SDK")
     if vulkan_sdk:
         bin_dir = os.path.join(vulkan_sdk, "bin")
         if os.path.isdir(bin_dir):
-            return (
-                os.path.join(bin_dir, "glslangValidator"),
-                os.path.join(bin_dir, "spirv-opt"),
-                os.path.join(bin_dir, "spirv-dis"),
-            )
+            tools = []
+            for name in ("glslangValidator", "spirv-opt", "spirv-dis"):
+                exe_name = name + ".exe" if os.name == "nt" else name
+                path = os.path.join(bin_dir, exe_name)
+                tools.append(path if os.path.isfile(path) else None)
+            if tools[0]:
+                return tuple(tools)
 
     # Fall back to PATH
-    return ("glslangValidator", "spirv-opt", "spirv-dis")
+    return (
+        find_tool("glslangValidator"),
+        find_tool("spirv-opt"),
+        find_tool("spirv-dis"),
+    )
 
 
 def parse_stage(filename):
@@ -55,6 +78,16 @@ def parse_stage(filename):
     if stage_key not in SPIRV_STAGES:
         return None, None
     return stage_key, SPIRV_STAGES[stage_key]
+
+
+def write_stderr(data):
+    # ROCKNIX/Odin: subprocess.run was sometimes returning stderr as bytes
+    # depending on the failing tool, which crashed sys.stderr.write directly.
+    if not data:
+        return
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    sys.stderr.write(data)
 
 
 def main():
@@ -78,6 +111,10 @@ def main():
     identifier = os.path.splitext(src_name)[0].replace(".", "_")
 
     glslang, spirv_opt, spirv_dis = find_vulkan_tools()
+    if not glslang:
+        print("ERROR: glslangValidator not found via VULKAN_SDK or PATH",
+              file=sys.stderr)
+        return 1
 
     # Create output directory if needed.
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -106,39 +143,46 @@ def main():
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if result.returncode != 0:
             print(f"ERROR: glslangValidator failed for {src_name}", file=sys.stderr)
-            if result.stderr:
-                sys.stderr.write(result.stderr)
+            write_stderr(result.stderr)
             return 1
 
-        # Step 2: spirv-opt
-        result = subprocess.run([
-            spirv_opt, "-O", "-O", "--canonicalize-ids",
-            glslang_spv, "-o", opt_spv,
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            print(f"ERROR: spirv-opt failed for {src_name}", file=sys.stderr)
-            if result.stderr:
-                sys.stderr.write(result.stderr)
-            return 1
+        # Step 2: spirv-opt, if available. The ARM64 builder image's
+        # spirv-tools build rejected --canonicalize-ids outright, so it has
+        # been dropped; falling back to unoptimized SPIR-V is also safe if
+        # spirv-opt itself isn't present at all (e.g. a minimal toolchain).
+        if spirv_opt:
+            result = subprocess.run([
+                spirv_opt, "-O", "-O",
+                glslang_spv, "-o", opt_spv,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                print(f"WARNING: spirv-opt failed for {src_name}; "
+                      "using unoptimized SPIR-V", file=sys.stderr)
+                write_stderr(result.stderr)
+                shutil.copyfile(glslang_spv, opt_spv)
+        else:
+            shutil.copyfile(glslang_spv, opt_spv)
 
-        # Step 3: spirv-dis
-        result = subprocess.run([spirv_dis, "-o", dis_txt, opt_spv],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            print(f"ERROR: spirv-dis failed for {src_name}", file=sys.stderr)
-            if result.stderr:
-                sys.stderr.write(result.stderr)
-            return 1
+        # Step 3: spirv-dis, if available. Only used for the disassembly
+        # comment in the generated header, so its absence isn't fatal.
+        if spirv_dis:
+            result = subprocess.run([spirv_dis, "-o", dis_txt, opt_spv],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                print(f"ERROR: spirv-dis failed for {src_name}", file=sys.stderr)
+                write_stderr(result.stderr)
+                return 1
 
         # Step 4: Generate header
         with open(output_path, "w") as out:
             out.write("// Generated with `xb buildshaders`.\n#if 0\n")
-            with open(dis_txt, "r") as dis_file:
-                dis_data = dis_file.read()
-                if dis_data:
-                    out.write(dis_data)
-                    if dis_data[-1] != "\n":
-                        out.write("\n")
+            if os.path.exists(dis_txt):
+                with open(dis_txt, "r") as dis_file:
+                    dis_data = dis_file.read()
+                    if dis_data:
+                        out.write(dis_data)
+                        if dis_data[-1] != "\n":
+                            out.write("\n")
             out.write("#endif\n\nconst uint32_t %s[] = {" % identifier)
             with open(opt_spv, "rb") as spv_file:
                 index = 0
